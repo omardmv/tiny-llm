@@ -1,3 +1,5 @@
+import math
+
 import mlx.core as mx
 from .basics import softmax, linear
 
@@ -9,8 +11,15 @@ def scaled_dot_product_attention_simple(
     scale: float | None = None,
     mask: mx.array | None = None,
 ) -> mx.array:
-    pass
-
+    """
+    A simple implementation of scaled dot product attention. Assuming Q, K, V are of the same shape.
+    Assuming mask is always a float array that you can add to the scores.
+    """
+    factor = mx.rsqrt(query.shape[-1]) if scale is None else scale
+    scores = mx.matmul(query, key.swapaxes(-2, -1)) * factor
+    if mask is not None:
+        scores = scores + mask
+    return mx.matmul(softmax(scores, axis=-1), value)
 
 class SimpleMultiHeadAttention:
     def __init__(
@@ -22,7 +31,19 @@ class SimpleMultiHeadAttention:
         wv: mx.array,
         wo: mx.array,
     ):
-        pass
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        assert hidden_size % num_heads == 0
+        self.head_dim = hidden_size // num_heads
+        self.scale = mx.rsqrt(self.head_dim)
+        assert wq.shape == (num_heads * self.head_dim, hidden_size)
+        assert wk.shape == (num_heads * self.head_dim, hidden_size)
+        assert wv.shape == (num_heads * self.head_dim, hidden_size)
+        assert wo.shape == (hidden_size, num_heads * self.head_dim)
+        self.wq = wq
+        self.wk = wk
+        self.wv = wv
+        self.wo = wo
 
     def __call__(
         self,
@@ -31,11 +52,38 @@ class SimpleMultiHeadAttention:
         value: mx.array,
         mask: mx.array | None = None,
     ) -> mx.array:
-        pass
+        N, L, _ = query.shape
+        assert query.shape == key.shape == value.shape
+        projection_q = (
+            linear(query, self.wq)
+            .reshape(N, L, self.num_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        projection_k = (
+            linear(key, self.wk)
+            .reshape(N, L, self.num_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        projection_v = (
+            linear(value, self.wv)
+            .reshape(N, L, self.num_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        x = scaled_dot_product_attention_simple(
+            projection_q,
+            projection_k,
+            projection_v,
+            scale=self.scale,
+            mask=mask,
+        )
+        x = x.transpose(0, 2, 1, 3).reshape(N, L, self.hidden_size)
+        return linear(x, self.wo)
 
 
 def causal_mask(L: int, S: int, dtype: mx.Dtype) -> mx.array:
-    pass
+    mask = mx.tril(mx.ones((L, S)), k=(S - L))
+    mask = mx.where(mask, mx.array(0), mx.array(-mx.inf)).astype(dtype)
+    return mask
 
 
 def scaled_dot_product_attention_grouped(
@@ -45,7 +93,38 @@ def scaled_dot_product_attention_grouped(
     scale: float | None = None,
     mask: mx.array | str | None = None,
 ) -> mx.array:
-    pass
+    """
+    Potential input of the mask:
+    - mx.array that can broadcast to B * H_q * L * S, which needs to be reshaped to match multi-head dimensions
+    - None which will be ignored
+    """
+    factor = mx.rsqrt(query.shape[-1]) if scale is None else mx.array(scale)
+    factor = factor.astype(query.dtype)
+    expected_shape = query.shape
+
+    H_q, L, D = query.shape[-3:]
+    H, S, _ = key.shape[-3:]
+    B = query.shape[:-3]
+    assert H_q % H == 0
+    n_repeats = H_q // H
+
+    query = query.reshape(*B, -1, H, n_repeats, L, D)
+    key = key.reshape(*B, -1, H, 1, S, D)
+    value = value.reshape(*B, -1, H, 1, S, D)
+
+    scores = mx.matmul(query, key.swapaxes(-2, -1)) * factor
+    if mask is not None:
+        if mask == "causal":
+            if L > S:
+                raise ValueError("causal attention requires S >= L")
+            mask = causal_mask(L, S, scores.dtype)
+            scores = scores + mask
+        else:
+            mask = mx.broadcast_to(mask, (*B, H_q, L, S))
+            mask = mask.reshape(*B, 1, H, n_repeats, L, S)
+            scores = scores + mask
+    result = mx.matmul(softmax(scores, axis=-1), value)
+    return result.reshape(expected_shape)
 
 
 def paged_attention(
